@@ -1,82 +1,76 @@
-{-# LANGUAGE FlexibleInstances, MultiParamTypeClasses #-}
+{-# LANGUAGE BlockArguments, DeriveAnyClass, DerivingStrategies, FlexibleInstances, MultiParamTypeClasses #-}
 
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
-import Data.Fixed         (E6, Fixed(..))
 import Data.IORef
+import Data.Maybe (isJust)
 import Data.TimerWheel
-import System.Random
+import System.Mem (performGC)
+import System.Mem.Weak (deRefWeak)
 
 main :: IO ()
 main = do
   do
     putStrLn "Timer wheel runs scheduled actions"
-    let n = 10000
-    ref <- newIORef (0::Int)
-    wheel <- create Config { spokes = 4, resolution = 0.25 }
-    putStrLn ("> Inserting " ++ show n ++ " timers")
-    replicateM_ n $ do
-      delay <- randomRIO (0, 4*1000*1000)
-      register_ wheel (modifyIORef' ref (+1)) (MkFixed delay)
-    putStrLn "> Sleeping for 5s"
-    sleep 5
-    readIORef ref `is` n
-    destroy wheel
+    with Config { spokes = 4, resolution = 0.05 } \wheel -> do
+      var <- newEmptyMVar
+      let n = 1000
+      replicateM_ n (register_ wheel 0 (putMVar var ()))
+      replicateM_ n (takeMVar var)
 
   do
     putStrLn "Timers can be canceled"
-    let n = 10000
-    ref <- newIORef (0::Int)
-    wheel <- create Config { spokes = 4, resolution = 0.25 }
-    putStrLn ("> Inserting " ++ show n ++ " timers")
-    cancels <-
-      replicateM n $ do
-        delay <- randomRIO (0, 4*1000*1000)
-        register wheel (modifyIORef' ref (+1)) (MkFixed delay)
-    putStrLn "> Sleeping for 2s"
-    sleep 2
-    putStrLn "> Canceling all timers"
-    successes <- sequence cancels
-    readIORef ref `is` (n - length (filter id successes))
-    destroy wheel
+    var <- newEmptyMVar
+    with Config { spokes = 4, resolution = 0.05 } \wheel -> do
+      let n = 1000
+      cancels <- replicateM n (register wheel 0 (putMVar var ()))
+      successes <- sequence (take (n `div` 2) cancels)
+      replicateM_ (n - length (filter id successes)) (takeMVar var)
 
   do
-    putStrLn "Re-calling a successful cancel works"
-    wheel <- create Config { spokes = 4, resolution = 0.25 }
-    cancel <- register wheel (pure ()) 1
-    cancel `is` True
-    cancel `is` True
-    destroy wheel
+    putStrLn "Successful `cancel` returns True (then False)"
+    with Config { spokes = 4, resolution = 0.05 } \wheel -> do
+      cancel <- register wheel 1 (pure ())
+      cancel `is` True
+      cancel `is` False
 
   do
-    putStrLn "Re-calling a failed cancel works"
-    wheel <- create Config { spokes = 4, resolution = 0.25 }
-    cancel <- register wheel (pure ()) 0.5
-    sleep 1
-    cancel `is` False
-    cancel `is` False
-    destroy wheel
+    putStrLn "Unsuccessful `cancel` returns False"
+    with Config { spokes = 4, resolution = 0.05 } \wheel -> do
+      var <- newEmptyMVar
+      cancel <- register wheel 0 (putMVar var ())
+      takeMVar var
+      cancel `is` False
 
   do
     putStrLn "Recurring timers work"
-    ref <- newIORef (0::Int)
-    wheel <- create Config { spokes = 4, resolution = 0.05 }
-    recurring_ wheel (modifyIORef' ref (+1)) 0.15
-    sleep 1
-    readIORef ref `is` (6::Int)
-    destroy wheel
+    with Config { spokes = 4, resolution = 0.05 } \wheel -> do
+      canary <- newIORef () -- kept alive only by timer
+      weakCanary <- mkWeakIORef canary (pure ())
+      var <- newEmptyMVar
+      cancel <- recurring wheel 0 (readIORef canary >> putMVar var ())
+      replicateM_ 2 (takeMVar var)
+      cancel -- should drop reference canary after a GC
+      performGC
+      (isJust <$> deRefWeak weakCanary) `is` False
 
   do
-    putStrLn "Recurring timers can be canceled"
-    ref <- newIORef (0::Int)
-    wheel <- create Config { spokes = 4, resolution = 0.05 }
-    cancel <- recurring wheel (modifyIORef' ref (+1)) 0.15
-    sleep 1
-    cancel
-    sleep 1
-    readIORef ref `is` (6::Int)
-    destroy wheel
+    putStrLn "`with` re-throws exception from background thread"
+    catch
+      (with Config { spokes = 4, resolution = 0.05 } \wheel -> do
+        var <- newEmptyMVar
+        register_ wheel 0 (throwIO Bye >> putMVar var ())
+        takeMVar var
+        throwIO (userError "fail"))
+      (\ex ->
+        case fromException ex of
+          Just Bye -> pure ()
+          _ -> throwIO ex)
+
+data Bye = Bye
+  deriving stock (Show)
+  deriving anyclass (Exception)
 
 class Assert a b where
   is :: a -> b -> IO ()
@@ -85,6 +79,3 @@ instance (Eq a, Show a) => Assert (IO a) a where
   is mx y = do
     x <- mx
     unless (x == y) (throwIO (userError (show x ++ " /= " ++ show y)))
-
-sleep :: Fixed E6 -> IO ()
-sleep (MkFixed micro) = threadDelay (fromIntegral micro)
